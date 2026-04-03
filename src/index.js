@@ -15,6 +15,13 @@ export default {
             });
         }
 
+        // 根路径：返回 Hello World（验证服务是否正常运行）
+        if (path === '/') {
+            return new Response('Hello World! Tic-Tac-Toe Backend is running.', {
+                headers: { 'Content-Type': 'text/plain' },
+            });
+        }
+
         // 创建房间
         if (path === '/api/create' && request.method === 'POST') {
             const roomId = generateRoomId();
@@ -50,6 +57,7 @@ export default {
             return obj.handleWebSocket(request, role, playerName);
         }
 
+        // 未匹配任何路由
         return new Response('Not found', { status: 404 });
     }
 };
@@ -188,4 +196,4 @@ export class RoomObject {
         this.broadcast(JSON.stringify({ type: 'error', message: '对手已断开连接' }));
         this.state.closeAllWebSockets();
     }
-                            }
+}
