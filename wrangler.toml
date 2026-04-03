@@ -1,0 +1,11 @@
+name = "tic-tac-toe-backend"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+[[durable_objects.bindings]]
+name = "ROOM_OBJECT"
+class_name = "RoomObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RoomObject"]
