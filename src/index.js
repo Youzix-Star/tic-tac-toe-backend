@@ -1,9 +1,10 @@
-// Cloudflare Worker 后端 - 井字棋联机服务
+// Cloudflare Worker 后端 - 井字棋联机服务 (重构版)
 export default {
     async fetch(request, env) {
         const url = new URL(request.url);
         const path = url.pathname;
 
+        // CORS 预检请求
         if (request.method === 'OPTIONS') {
             return new Response(null, {
                 headers: {
@@ -14,12 +15,14 @@ export default {
             });
         }
 
+        // 健康检查
         if (path === '/') {
-            return new Response('Hello World! Tic-Tac-Toe Backend is running.', {
+            return new Response('Tic-Tac-Toe Backend is running.', {
                 headers: { 'Content-Type': 'text/plain' },
             });
         }
 
+        // 创建房间
         if (path === '/api/create' && request.method === 'POST') {
             const roomId = generateRoomId();
             const id = env.ROOM_OBJECT.idFromName(roomId);
@@ -28,6 +31,7 @@ export default {
             return jsonResponse({ roomId });
         }
 
+        // 加入房间
         if (path === '/api/join' && request.method === 'POST') {
             const { roomId } = await request.json();
             const id = env.ROOM_OBJECT.idFromName(roomId);
@@ -40,9 +44,10 @@ export default {
             }
         }
 
+        // WebSocket 升级
         if (path === '/api/ws') {
             const roomId = url.searchParams.get('roomId');
-            const role = url.searchParams.get('role');
+            const role = url.searchParams.get('role'); // 'X' 或 'O'
             const playerName = url.searchParams.get('name') || 'Player';
             if (!roomId || !role) {
                 return new Response('Missing roomId or role', { status: 400 });
@@ -70,14 +75,16 @@ function jsonResponse(data, status = 200) {
     });
 }
 
-// Durable Object 类定义
+// Durable Object 管理一个房间
 export class RoomObject {
     constructor(state, env) {
         this.state = state;
-        this.websockets = new Map();
+        this.websockets = new Map(); // role -> { ws, name }
         this.board = Array(9).fill(null);
         this.currentTurn = 'X';
-        this.gameActive = true;
+        this.gameActive = false;      // 游戏是否进行中（两个玩家都连接后开始）
+        this.winner = null;
+        this.roomId = null;
     }
 
     async create(roomId) {
@@ -97,6 +104,7 @@ export class RoomObject {
         this.websockets.set(role, { ws: server, name: playerName });
         this.state.acceptWebSocket(server, [role]);
 
+        // 如果两人齐了，开始游戏
         if (this.websockets.size === 2) {
             this.startGame();
         }
@@ -105,6 +113,12 @@ export class RoomObject {
     }
 
     async startGame() {
+        if (this.websockets.size !== 2) return;
+        this.gameActive = true;
+        this.board = Array(9).fill(null);
+        this.currentTurn = 'X';
+        this.winner = null;
+
         const xWs = this.websockets.get('X')?.ws;
         const oWs = this.websockets.get('O')?.ws;
         if (xWs && oWs) {
@@ -113,32 +127,68 @@ export class RoomObject {
         }
     }
 
+    async resetGame() {
+        if (this.websockets.size < 2) return;
+        this.gameActive = true;
+        this.board = Array(9).fill(null);
+        this.currentTurn = 'X';
+        this.winner = null;
+        this.broadcast(JSON.stringify({ type: 'reset_game' }));
+    }
+
     async webSocketMessage(ws, message) {
         const data = JSON.parse(message);
-        if (data.type === 'move') {
-            const role = this.getRoleByWs(ws);
-            if (!role) return;
-            if ((role === 'X' && this.currentTurn !== 'X') || (role === 'O' && this.currentTurn !== 'O')) {
-                ws.send(JSON.stringify({ type: 'error', message: 'Not your turn' }));
-                return;
-            }
-            const index = data.index;
-            if (this.board[index] !== null) {
-                ws.send(JSON.stringify({ type: 'error', message: 'Invalid move' }));
-                return;
-            }
-            this.board[index] = role;
-            this.broadcast(JSON.stringify({ type: 'move', index }));
+        const role = this.getRoleByWs(ws);
+        if (!role) return;
 
-            const result = this.checkGameResult();
-            if (result.finished) {
-                this.gameActive = false;
-                this.broadcast(JSON.stringify({ type: 'game_end', winner: result.winner, reason: result.reason }));
-                this.websockets.clear();
-                this.state.closeAllWebSockets();
-            } else {
-                this.currentTurn = this.currentTurn === 'X' ? 'O' : 'X';
-            }
+        switch (data.type) {
+            case 'move':
+                await this.handleMove(ws, role, data.index);
+                break;
+            case 'reset':
+                await this.resetGame();
+                break;
+            default:
+                ws.send(JSON.stringify({ type: 'error', message: 'Unknown message type' }));
+        }
+    }
+
+    async handleMove(ws, role, index) {
+        // 游戏未激活
+        if (!this.gameActive) {
+            ws.send(JSON.stringify({ type: 'error', message: '游戏未开始' }));
+            return;
+        }
+        // 回合校验
+        if (role !== this.currentTurn) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Not your turn' }));
+            return;
+        }
+        // 位置合法性
+        if (index < 0 || index >= 9 || this.board[index] !== null) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Invalid move' }));
+            return;
+        }
+
+        // 执行落子
+        this.board[index] = role;
+        // 广播移动（包含角色，方便前端直接应用）
+        this.broadcast(JSON.stringify({ type: 'move', index, player: role }));
+
+        // 检查游戏结果
+        const result = this.checkGameResult();
+        if (result.finished) {
+            this.gameActive = false;
+            this.winner = result.winner;
+            this.broadcast(JSON.stringify({
+                type: 'game_end',
+                winner: result.winner,
+                reason: result.reason
+            }));
+            // 游戏结束后不自动关闭连接，等待玩家发送 reset
+        } else {
+            // 切换回合
+            this.currentTurn = this.currentTurn === 'X' ? 'O' : 'X';
         }
     }
 
@@ -176,7 +226,19 @@ export class RoomObject {
     async webSocketClose(ws, code, reason, wasClean) {
         const role = this.getRoleByWs(ws);
         if (role) this.websockets.delete(role);
-        this.broadcast(JSON.stringify({ type: 'error', message: '对手已断开连接' }));
+        // 通知另一方对方断开
+        if (this.websockets.size > 0) {
+            this.broadcast(JSON.stringify({ type: 'error', message: '对手已断开连接' }));
+        }
+        // 关闭所有连接，清理房间
         this.state.closeAllWebSockets();
     }
-}
+
+    async webSocketError(ws, error) {
+        console.error('WebSocket error:', error);
+        const role = this.getRoleByWs(ws);
+        if (role) this.websockets.delete(role);
+        this.broadcast(JSON.stringify({ type: 'error', message: '连接出错' }));
+        this.state.closeAllWebSockets();
+    }
+                }
